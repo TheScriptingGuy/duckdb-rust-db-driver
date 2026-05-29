@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: fmt / clippy / check / test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cargo fmt check
+        run: cargo fmt -- --check
+
+      - name: Cargo clippy (all features)
+        run: cargo clippy --all-features -- -D warnings
+
+      - name: Cargo check (all features)
+        run: cargo check --all-features
+
+      - name: Build examples (all features)
+        run: cargo build --examples --all-features
+
+      - name: Cargo test (duckdb integration)
+        run: cargo test --features duckdb --test test_duckdb
