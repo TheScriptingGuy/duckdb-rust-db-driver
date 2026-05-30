@@ -1,7 +1,7 @@
 use duckdb::duckdb_entrypoint_c_api;
 use duckdb::Connection;
 
-#[duckdb_entrypoint_c_api(ext_name = "db_driver", min_duckdb_version = "v0.0.1")]
+#[duckdb_entrypoint_c_api(ext_name = "rust_db_driver", min_duckdb_version = "v0.0.1")]
 pub fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "postgres")]
     con.register_table_function::<crate::vtab::RemoteVTab<crate::vtab::PostgresConnector>>(

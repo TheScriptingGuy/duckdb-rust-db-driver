@@ -1,5 +1,5 @@
 [package]
-name = "db-driver"
+name = "rust-db-driver"
 version = "0.1.0"
 edition = "2021"
 resolver = "2"
@@ -7,7 +7,7 @@ description = "DuckDB extension for querying PostgreSQL, MySQL, and SQL Server f
 license = "MIT"
 
 [lib]
-name = "db_driver"
+name = "rust_db_driver"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
