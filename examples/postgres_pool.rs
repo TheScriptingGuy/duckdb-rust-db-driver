@@ -2,11 +2,11 @@
 
 #[cfg(feature = "postgres")]
 #[tokio::main]
-async fn main() -> Result<(), db_driver::DbError> {
-    use db_driver::{AuthConfig, DatabaseConfig, DbDriver, PoolConfig, PostgresDriver};
+async fn main() -> Result<(), rust_db_driver::DbError> {
+    use rust_db_driver::{AuthConfig, DatabaseConfig, DbDriver, PoolConfig, PostgresDriver};
     use std::time::Duration;
 
-    let auth = AuthConfig::SqlPassword(db_driver::auth::SqlAuth::new(
+    let auth = AuthConfig::SqlPassword(rust_db_driver::auth::SqlAuth::new(
         std::env::var("PG_USER").unwrap_or_else(|_| "postgres".to_string()),
         std::env::var("PG_PASSWORD").unwrap_or_else(|_| "secret".to_string()),
     ));
@@ -41,7 +41,7 @@ async fn main() -> Result<(), db_driver::DbError> {
     let rows = driver
         .query(
             "SELECT generate_series AS n FROM generate_series($1::int, $2::int)",
-            &[db_driver::Value::Int32(1), db_driver::Value::Int32(5)],
+            &[rust_db_driver::Value::Int32(1), rust_db_driver::Value::Int32(5)],
         )
         .await?;
 
