@@ -12,8 +12,8 @@
 
 #[cfg(all(feature = "mssql", feature = "azure-auth"))]
 #[tokio::main]
-async fn main() -> Result<(), db_driver::DbError> {
-    use db_driver::{AuthConfig, DatabaseConfig, DbDriver, MssqlDriver};
+async fn main() -> Result<(), rust_db_driver::DbError> {
+    use rust_db_driver::{AuthConfig, DatabaseConfig, DbDriver, MssqlDriver};
 
     let server = std::env::var("SYNAPSE_SERVERLESS_SERVER")
         .unwrap_or_else(|_| "myworkspace-ondemand.sql.azuresynapse.net".to_string());

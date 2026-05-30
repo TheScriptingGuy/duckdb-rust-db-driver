@@ -9,8 +9,8 @@
 
 #[cfg(all(feature = "mssql", feature = "azure-auth"))]
 #[tokio::main]
-async fn main() -> Result<(), db_driver::DbError> {
-    use db_driver::{AuthConfig, DatabaseConfig, DbDriver, MssqlDriver};
+async fn main() -> Result<(), rust_db_driver::DbError> {
+    use rust_db_driver::{AuthConfig, DatabaseConfig, DbDriver, MssqlDriver};
 
     let server = std::env::var("AZURE_SQL_SERVER")
         .unwrap_or_else(|_| "myserver.database.windows.net".to_string());
@@ -42,8 +42,8 @@ async fn main() -> Result<(), db_driver::DbError> {
         .query(
             "SELECT TOP (@p1) name FROM sys.objects WHERE type = @p2",
             &[
-                db_driver::Value::Int32(5),
-                db_driver::Value::Text("U".to_string()),
+                rust_db_driver::Value::Int32(5),
+                rust_db_driver::Value::Text("U".to_string()),
             ],
         )
         .await?;
