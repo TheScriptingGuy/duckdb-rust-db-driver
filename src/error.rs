@@ -72,17 +72,3 @@ impl From<tiberius::error::Error> for DbError {
         DbError::Backend(e.to_string())
     }
 }
-
-#[cfg(feature = "duckdb")]
-impl From<::duckdb::Error> for DbError {
-    fn from(e: ::duckdb::Error) -> Self {
-        DbError::Backend(e.to_string())
-    }
-}
-
-#[cfg(feature = "duckdb")]
-impl From<r2d2::Error> for DbError {
-    fn from(e: r2d2::Error) -> Self {
-        DbError::Pool(e.to_string())
-    }
-}

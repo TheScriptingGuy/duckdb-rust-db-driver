@@ -3,28 +3,28 @@ name = "db-driver"
 version = "0.1.0"
 edition = "2021"
 resolver = "2"
-description = "High-performance async Rust driver for PostgreSQL, MySQL, SQL Server, Azure SQL, Synapse and DuckDB"
+description = "DuckDB extension for querying PostgreSQL, MySQL, and SQL Server from inside DuckDB SQL"
 license = "MIT"
 
 [lib]
 name = "db_driver"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[example]]
 name = "postgres_pool"
 path = "examples/postgres_pool.rs"
+required-features = ["postgres"]
 
 [[example]]
 name = "azure_sql_aad"
 path = "examples/azure_sql_aad.rs"
-
-[[example]]
-name = "duckdb_query"
-path = "examples/duckdb_query.rs"
+required-features = ["mssql", "azure-auth"]
 
 [[example]]
 name = "synapse_serverless"
 path = "examples/synapse_serverless.rs"
+required-features = ["mssql", "azure-auth"]
 
 [dependencies]
 tokio       = { version = "1", features = ["full"] }
@@ -36,6 +36,9 @@ chrono      = { version = "0.4", features = ["serde"] }
 uuid        = { version = "1", features = ["v4"] }
 tracing     = "0.1"
 futures     = "0.3"
+
+# DuckDB extension runtime (always required — this crate IS the extension)
+duckdb = { version = "1", features = ["loadable-extension"] }
 
 # PostgreSQL
 tokio-postgres    = { version = "0.7", optional = true, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
@@ -56,20 +59,15 @@ tiberius   = { version = "0.12", optional = true, default-features = false, feat
 tokio-util = { version = "0.7", optional = true, features = ["compat"] }
 deadpool   = { version = "0.13", optional = true, features = ["managed"] }
 
-# DuckDB
-duckdb = { version = "1", optional = true, features = ["bundled", "r2d2"] }
-r2d2   = { version = "0.8", optional = true }
-
 # Azure Identity
 azure_identity = { version = "1", optional = true }
 azure_core     = { version = "1", optional = true }
 
 [features]
-default    = ["postgres", "mysql", "mssql", "duckdb", "azure-auth"]
+default    = ["postgres", "mysql", "mssql", "azure-auth"]
 postgres   = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 mysql      = ["dep:sqlx"]
 mssql      = ["dep:tiberius", "dep:tokio-util", "dep:deadpool"]
-duckdb     = ["dep:duckdb", "dep:r2d2"]
 azure-auth = ["dep:azure_identity", "dep:azure_core"]
 
 [dev-dependencies]
@@ -81,3 +79,4 @@ opt-level = 0
 [profile.release]
 opt-level = 3
 lto = "thin"
+panic = "abort"

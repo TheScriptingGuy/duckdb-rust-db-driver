@@ -9,7 +9,7 @@ env:
 
 jobs:
   ci:
-    name: fmt / clippy / check / test
+    name: fmt / clippy / check / build
     runs-on: ubuntu-latest
 
     steps:
@@ -34,14 +34,14 @@ jobs:
       - name: Cargo fmt check
         run: cargo fmt -- --check
 
-      - name: Cargo clippy (all features)
-        run: cargo clippy --all-features -- -D warnings
+      - name: Cargo clippy
+        run: cargo clippy --features postgres,mysql,mssql,azure-auth -- -D warnings
 
-      - name: Cargo check (all features)
-        run: cargo check --all-features
+      - name: Cargo check
+        run: cargo check --features postgres,mysql,mssql,azure-auth
 
-      - name: Build examples (all features)
-        run: cargo build --examples --all-features
+      - name: Build extension (all backends)
+        run: cargo build --lib --features postgres,mysql,mssql,azure-auth
 
-      - name: Cargo test (duckdb integration)
-        run: cargo test --features duckdb --test test_duckdb
+      - name: Build examples
+        run: cargo build --examples --features postgres,mysql,mssql,azure-auth
