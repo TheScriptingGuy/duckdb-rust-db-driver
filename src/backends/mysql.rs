@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use async_trait::async_trait;
 use sqlx::{Arguments, AssertSqlSafe, Column as SqlxColumn, MySqlPool, TypeInfo};
 
@@ -13,7 +15,7 @@ pub struct MySqlDriver {
 
 impl MySqlDriver {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, DbError> {
-        let url = build_mysql_url(config)?;
+        let opts = build_mysql_opts(config)?;
 
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .min_connections(config.pool.min_connections)
@@ -21,7 +23,7 @@ impl MySqlDriver {
             .acquire_timeout(config.pool.connect_timeout)
             .idle_timeout(config.pool.idle_timeout)
             .max_lifetime(config.pool.max_lifetime)
-            .connect(&url)
+            .connect_with(opts)
             .await
             .map_err(DbError::from)?;
 
@@ -29,38 +31,40 @@ impl MySqlDriver {
     }
 }
 
-fn build_mysql_url(config: &DatabaseConfig) -> Result<String, DbError> {
-    if let Some(cs) = &config.connection_string {
-        return Ok(cs.clone());
-    }
+fn build_mysql_opts(config: &DatabaseConfig) -> Result<sqlx::mysql::MySqlConnectOptions, DbError> {
+    use sqlx::mysql::MySqlSslMode;
 
-    match &config.auth {
-        AuthConfig::SqlPassword(sql_auth) => {
-            let host = &config.host;
-            let port = config.port;
-            let db = &config.database;
-            let user = urlencoding_simple(&sql_auth.username);
-            let pass = urlencoding_simple(&sql_auth.password);
-            Ok(format!(
-                "mysql://{}:{}@{}:{}/{}",
-                user, pass, host, port, db
-            ))
+    let mut opts = if let Some(cs) = &config.connection_string {
+        sqlx::mysql::MySqlConnectOptions::from_str(cs)
+            .map_err(|e| DbError::Config(e.to_string()))?
+    } else {
+        match &config.auth {
+            AuthConfig::SqlPassword(sql_auth) => sqlx::mysql::MySqlConnectOptions::new()
+                .host(&config.host)
+                .port(config.port)
+                .database(&config.database)
+                .username(&sql_auth.username)
+                .password(&sql_auth.password),
+            AuthConfig::None => sqlx::mysql::MySqlConnectOptions::new()
+                .host(&config.host)
+                .port(config.port)
+                .database(&config.database),
+            _ => {
+                return Err(DbError::NotSupported(
+                    "MySQL only supports SQL password auth".to_string(),
+                ))
+            }
         }
-        AuthConfig::None => Ok(format!(
-            "mysql://{}:{}/{}",
-            config.host, config.port, config.database
-        )),
-        _ => Err(DbError::NotSupported(
-            "MySQL only supports SQL password auth".to_string(),
-        )),
-    }
-}
+    };
 
-fn urlencoding_simple(s: &str) -> String {
-    s.replace('%', "%25")
-        .replace('@', "%40")
-        .replace(':', "%3A")
-        .replace('/', "%2F")
+    let ssl_mode = match (config.tls, config.trust_cert) {
+        (false, _) => MySqlSslMode::Disabled,
+        (true, true) => MySqlSslMode::Required,
+        (true, false) => MySqlSslMode::VerifyIdentity,
+    };
+    opts = opts.ssl_mode(ssl_mode);
+
+    Ok(opts)
 }
 
 fn build_mysql_args(params: &[Value]) -> Result<sqlx::mysql::MySqlArguments, DbError> {

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use deadpool_postgres::{Config as PgPoolConfig, Pool, PoolConfig, Runtime, Timeouts};
 use tokio_postgres::{types::Type, NoTls, Row as PgRow};
@@ -48,9 +50,13 @@ impl PostgresDriver {
             ..Default::default()
         });
 
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| DbError::Config(e.to_string()))?;
+        let pool = if config.tls {
+            cfg.create_pool(Some(Runtime::Tokio1), build_pg_tls(config.trust_cert))
+                .map_err(|e| DbError::Config(e.to_string()))?
+        } else {
+            cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+                .map_err(|e| DbError::Config(e.to_string()))?
+        };
 
         Ok(Self { pool })
     }
@@ -143,6 +149,72 @@ fn pg_row_to_row(row: &PgRow) -> Result<Row, DbError> {
         .collect();
 
     Ok(Row::new(columns, values?))
+}
+
+fn build_pg_tls(trust_cert: bool) -> tokio_postgres_rustls::MakeRustlsConnect {
+    let config = if trust_cert {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth()
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
+    tokio_postgres_rustls::MakeRustlsConnect::new(config)
+}
+
+#[derive(Debug)]
+struct AcceptAnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 fn pg_col_to_value(row: &PgRow, i: usize, ty: &Type) -> Result<Value, DbError> {
