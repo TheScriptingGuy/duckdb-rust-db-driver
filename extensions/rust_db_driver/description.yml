@@ -1,0 +1,19 @@
+# Submit this file in a PR to https://github.com/duckdb/community-extensions
+# under extensions/rust_db_driver/description.yml to list this extension in
+# the DuckDB community registry (enables: INSTALL rust_db_driver FROM community).
+
+extension:
+  name: rust_db_driver
+  description: >-
+    Query PostgreSQL, MySQL, and SQL Server from inside DuckDB SQL using
+    postgres_query(), mysql_query(), and mssql_query() table functions.
+  version: 0.1.0
+  language: Rust
+  build: cargo
+  license: MIT
+  maintainers:
+    - TheScriptingGuy
+
+repo:
+  github: TheScriptingGuy/duckdb-rust-db-driver
+  ref: v0.1.0

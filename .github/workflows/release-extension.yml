@@ -18,23 +18,23 @@ jobs:
         include:
           - target: linux-amd64
             runner: ubuntu-latest
-            lib: libdb_driver.so
+            lib: librust_db_driver.so
 
           - target: linux-arm64
             runner: ubuntu-24.04-arm
-            lib: libdb_driver.so
+            lib: librust_db_driver.so
 
           - target: osx-amd64
             runner: macos-13
-            lib: libdb_driver.dylib
+            lib: librust_db_driver.dylib
 
           - target: osx-arm64
             runner: macos-latest
-            lib: libdb_driver.dylib
+            lib: librust_db_driver.dylib
 
           - target: windows-amd64
             runner: windows-latest
-            lib: db_driver.dll
+            lib: rust_db_driver.dll
 
     steps:
       - uses: actions/checkout@v4
@@ -60,20 +60,20 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/release/${{ matrix.lib }} dist/db_driver-${{ matrix.target }}.duckdb_extension
+          cp target/release/${{ matrix.lib }} dist/rust_db_driver-${{ matrix.target }}.duckdb_extension
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Copy-Item "target\release\${{ matrix.lib }}" "dist\db_driver-${{ matrix.target }}.duckdb_extension"
+          Copy-Item "target\release\${{ matrix.lib }}" "dist\rust_db_driver-${{ matrix.target }}.duckdb_extension"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/db_driver-${{ matrix.target }}.duckdb_extension
+          path: dist/rust_db_driver-${{ matrix.target }}.duckdb_extension
 
   release:
     name: Create GitHub Release
