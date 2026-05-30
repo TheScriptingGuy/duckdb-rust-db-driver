@@ -1,0 +1,94 @@
+name: Release DuckDB Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+            lib: libdb_driver.so
+
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            lib: libdb_driver.so
+
+          - target: osx-amd64
+            runner: macos-13
+            lib: libdb_driver.dylib
+
+          - target: osx-arm64
+            runner: macos-latest
+            lib: libdb_driver.dylib
+
+          - target: windows-amd64
+            runner: windows-latest
+            lib: db_driver.dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build extension
+        run: cargo build --release --lib
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/release/${{ matrix.lib }} dist/db_driver-${{ matrix.target }}.duckdb_extension
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target\release\${{ matrix.lib }}" "dist\db_driver-${{ matrix.target }}.duckdb_extension"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/db_driver-${{ matrix.target }}.duckdb_extension
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.duckdb_extension
+          generate_release_notes: true
