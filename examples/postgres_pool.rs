@@ -41,7 +41,10 @@ async fn main() -> Result<(), rust_db_driver::DbError> {
     let rows = driver
         .query(
             "SELECT generate_series AS n FROM generate_series($1::int, $2::int)",
-            &[rust_db_driver::Value::Int32(1), rust_db_driver::Value::Int32(5)],
+            &[
+                rust_db_driver::Value::Int32(1),
+                rust_db_driver::Value::Int32(5),
+            ],
         )
         .await?;
 
