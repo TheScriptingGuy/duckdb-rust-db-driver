@@ -214,12 +214,23 @@ impl BackendConnector for PostgresConnector {
         use crate::driver::DbDriver;
         use crate::pool::PoolConfig;
 
+        // Default to TLS with trust_cert so self-signed certs work out of the box.
+        // Honour sslmode=disable in the URL to let users opt out explicitly.
+        let disable_tls = conn_str
+            .split('?')
+            .nth(1)
+            .unwrap_or("")
+            .split('&')
+            .any(|p| p.eq_ignore_ascii_case("sslmode=disable"));
+
         let mut config = DatabaseConfig::postgres(
             "",
             5432,
             "",
             AuthConfig::ConnectionString(conn_str.to_string()),
         );
+        config.tls = !disable_tls;
+        config.trust_cert = true;
         config.pool = PoolConfig {
             min_connections: 0,
             max_connections: 1,
@@ -310,6 +321,7 @@ fn parse_mssql_conn_str(
     let mut username = String::new();
     let mut password = String::new();
     let mut trust_cert = false;
+    let mut encrypt = true; // MSSQL encrypts by default
 
     for part in conn_str.split(';') {
         let part = part.trim();
@@ -333,6 +345,7 @@ fn parse_mssql_conn_str(
             "userid" | "uid" | "user" => username = val.trim().to_string(),
             "password" | "pwd" => password = val.trim().to_string(),
             "trustservercertificate" => trust_cert = val.trim().eq_ignore_ascii_case("true"),
+            "encrypt" => encrypt = !val.trim().eq_ignore_ascii_case("false"),
             _ => {}
         }
     }
@@ -343,6 +356,7 @@ fn parse_mssql_conn_str(
         database,
         AuthConfig::SqlPassword(SqlAuth { username, password }),
     );
+    config.tls = encrypt;
     config.trust_cert = trust_cert;
     config.pool = PoolConfig {
         min_connections: 0,

@@ -41,8 +41,11 @@ futures     = "0.3"
 duckdb = { version = "1", features = ["loadable-extension"] }
 
 # PostgreSQL
-tokio-postgres    = { version = "0.7", optional = true, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
-deadpool-postgres = { version = "0.14", optional = true }
+tokio-postgres         = { version = "0.7", optional = true, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+deadpool-postgres      = { version = "0.14", optional = true }
+tokio-postgres-rustls  = { version = "0.12", optional = true }
+rustls                 = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
+webpki-roots           = { version = "1", optional = true }
 
 # MySQL
 sqlx = { version = "0.9", optional = true, default-features = false, features = [
@@ -65,7 +68,7 @@ azure_core     = { version = "1", optional = true }
 
 [features]
 default    = ["postgres", "mysql", "mssql", "azure-auth"]
-postgres   = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+postgres   = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:webpki-roots"]
 mysql      = ["dep:sqlx"]
 mssql      = ["dep:tiberius", "dep:tokio-util", "dep:deadpool"]
 azure-auth = ["dep:azure_identity", "dep:azure_core"]
