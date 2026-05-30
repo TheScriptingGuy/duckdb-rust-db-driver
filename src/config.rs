@@ -8,7 +8,6 @@ pub enum BackendType {
     Postgres,
     MySQL,
     MsSql,
-    DuckDb,
 }
 
 #[derive(Debug, Clone)]
@@ -88,26 +87,6 @@ impl DatabaseConfig {
             application_name: None,
             connect_timeout: Duration::from_secs(30),
         }
-    }
-
-    pub fn duckdb(path: impl Into<String>) -> Self {
-        Self {
-            backend: BackendType::DuckDb,
-            host: String::new(),
-            port: 0,
-            database: path.into(),
-            auth: AuthConfig::None,
-            pool: PoolConfig::default(),
-            tls: false,
-            trust_cert: false,
-            connection_string: None,
-            application_name: None,
-            connect_timeout: Duration::from_secs(30),
-        }
-    }
-
-    pub fn duckdb_memory() -> Self {
-        Self::duckdb(":memory:")
     }
 
     pub fn with_pool(mut self, pool: PoolConfig) -> Self {

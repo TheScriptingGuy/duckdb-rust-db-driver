@@ -3,8 +3,10 @@ pub mod backends;
 pub mod config;
 pub mod driver;
 pub mod error;
+pub mod extension;
 pub mod pool;
 pub mod row;
+pub mod vtab;
 
 pub use config::{BackendType, DatabaseConfig};
 pub use driver::DbDriver;
@@ -20,8 +22,5 @@ pub use backends::MySqlDriver;
 
 #[cfg(feature = "mssql")]
 pub use backends::MssqlDriver;
-
-#[cfg(feature = "duckdb")]
-pub use backends::DuckDbDriver;
 
 pub use auth::AuthConfig;
