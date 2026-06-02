@@ -424,8 +424,44 @@ default    = ["postgres", "mysql", "mssql", "azure-auth"]
 
 ```bash
 cargo build --all-features          # build the library + extension
-cargo test  --all-features          # unit tests
+cargo test  --all-features --lib    # unit tests
+cargo test  --all-features --doc    # doc tests
 cargo clippy --all-features -- -D warnings
 cargo fmt --all
-docker compose up -d                # spin up postgres / mysql / mssql for integration tests
+docker compose up -d                # spin up postgres / mysql / mssql
 ```
+
+## Functional testing
+
+`scripts/run_functional_tests.sh` validates the **PostgreSQL** path end to end
+against a real database. It:
+
+1. brings up PostgreSQL (via `docker compose`, or uses an existing server when
+   `PG_HOST` is set) and seeds it from `test/sql/seed_postgres.sql`;
+2. runs the Rust integration tests in `tests/test_postgres.rs` — these exercise
+   `PostgresDriver` directly, including `query_partitioned` with both the
+   integer-range and UUID-range strategies, asserting the partitioned result
+   exactly equals the single-query result;
+3. if the `duckdb` Python module is installed, builds and packages the loadable
+   extension and runs `scripts/duckdb_smoke.py`, which **loads the extension
+   into DuckDB and queries Postgres through `postgres_query`** (plain,
+   integer-partitioned, and UUID-partitioned).
+
+```bash
+# One-shot, using docker compose for Postgres:
+scripts/run_functional_tests.sh
+
+# Against an already-running Postgres, skipping docker:
+USE_DOCKER=no PG_HOST=127.0.0.1 PG_USER=postgres PG_PASSWORD=postgres PG_DB=testdb \
+  scripts/run_functional_tests.sh
+```
+
+The Rust integration tests are `#[ignore]`d by default (they need a database);
+run them directly with:
+
+```bash
+cargo test --test test_postgres --features postgres -- --ignored
+```
+
+CI runs the same flow in `.github/workflows/functional.yml` against a
+`postgres:16` service.

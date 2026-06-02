@@ -331,13 +331,12 @@ impl BackendConnector for PostgresConnector {
         use crate::pool::PoolConfig;
 
         // Default to TLS with trust_cert so self-signed certs work out of the box.
-        // Honour sslmode=disable in the URL to let users opt out explicitly.
+        // Honour sslmode=disable so users can opt out explicitly. Accept both
+        // URL form (`...?sslmode=disable`) and libpq keyword form
+        // (`host=... sslmode=disable`).
         let disable_tls = conn_str
-            .split('?')
-            .nth(1)
-            .unwrap_or("")
-            .split('&')
-            .any(|p| p.eq_ignore_ascii_case("sslmode=disable"));
+            .split(['?', '&', ' '])
+            .any(|p| p.trim().eq_ignore_ascii_case("sslmode=disable"));
 
         let mut config = DatabaseConfig::postgres(
             "",

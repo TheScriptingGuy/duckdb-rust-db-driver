@@ -4,11 +4,11 @@
 
 #[cfg(feature = "mysql")]
 mod tests {
-    use db_driver::{AuthConfig, DatabaseConfig, DbDriver, MySqlDriver, PoolConfig, Value};
+    use rust_db_driver::{AuthConfig, DatabaseConfig, DbDriver, MySqlDriver, PoolConfig, Value};
     use std::time::Duration;
 
     fn test_config() -> DatabaseConfig {
-        let auth = AuthConfig::SqlPassword(db_driver::auth::SqlAuth::new(
+        let auth = AuthConfig::SqlPassword(rust_db_driver::auth::SqlAuth::new(
             std::env::var("MYSQL_USER").unwrap_or_else(|_| "root".to_string()),
             std::env::var("MYSQL_PASSWORD").unwrap_or_else(|_| "root".to_string()),
         ));
