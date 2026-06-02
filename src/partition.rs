@@ -2,16 +2,23 @@
 //! be run in parallel via [`crate::driver::DbDriver::query_partitioned`].
 //!
 //! SQL has no generic, safe way to "cut a query into N", so these helpers wrap
-//! your query as a subselect and add a slicing predicate. They embed only
-//! integer literals (never caller text), so the generated SQL is injection-safe
-//! and backend-agnostic — no placeholder-syntax differences to worry about.
+//! your query as a subselect and add a slicing predicate. The integer and
+//! offset helpers embed only integer literals; the UUID helper embeds canonical
+//! lowercase UUID literals. None of them interpolate caller-supplied row data,
+//! so the generated SQL is injection-safe.
 //!
-//! Two strategies are provided:
+//! Three strategies are provided:
 //!
-//! * [`by_int_range`] — split on a numeric key column. Predictable and
+//! * [`by_int_range`] — split on an integer key column. Predictable and
 //!   efficient when the key is indexed, but you must know the key's bounds.
+//! * [`by_uuid_range`] — split on a UUID key column over the 128-bit value
+//!   space. Correct only where the backend orders UUIDs by their byte value
+//!   (e.g. PostgreSQL `uuid`, MySQL `BINARY(16)` / lowercase `CHAR(36)`); see
+//!   the function docs for caveats.
 //! * [`by_offset`] — `LIMIT`/`OFFSET` paging. Works without a key, but needs a
 //!   stable `ORDER BY` and large offsets get progressively more expensive.
+
+use uuid::Uuid;
 
 use crate::driver::Partition;
 
@@ -123,6 +130,97 @@ pub fn by_offset(
     out
 }
 
+/// Compute `floor(a * num / den)` without overflowing `u128` for the
+/// intermediate product. Exact for all inputs where the result fits in `u128`.
+fn mul_div(a: u128, num: u128, den: u128) -> u128 {
+    (a / den) * num + ((a % den) * num) / den
+}
+
+/// Split a query into contiguous ranges over a UUID key column, slicing the
+/// full 128-bit value space `[min, max]`.
+///
+/// Each partition selects `key_column >= '<lo>' AND key_column < '<hi>'` (the
+/// final partition uses `<= '<max>'` so the upper bound is inclusive), with
+/// canonical lowercase UUID literals. The ranges tile `[min, max]` with no gaps
+/// or overlaps. Empty sub-ranges are skipped, so the result may contain fewer
+/// than `partitions` entries. `min > max` or `partitions == 0` yields an empty
+/// vector.
+///
+/// # Correctness depends on the backend's UUID ordering
+///
+/// This splits on the *numeric* (byte) order of the UUID. It is correct when
+/// the backend compares the key in that same order:
+///
+/// * **PostgreSQL `uuid`** — ordered by byte value. ✅
+/// * **MySQL** stored as `BINARY(16)`, or lowercase canonical `CHAR(36)` under a
+///   binary/`ascii` collation — string comparison matches byte order. ✅
+/// * **SQL Server `uniqueidentifier`** — uses a *different* comparison order, so
+///   range slicing can drop or duplicate rows. ❌ Use [`by_offset`] instead, or
+///   partition on a different (integer) column.
+///
+/// ```
+/// # use rust_db_driver::partition;
+/// # use uuid::Uuid;
+/// let lo = Uuid::from_u128(0); // 0000...0000
+/// let hi = Uuid::from_u128(u128::MAX); // ffff...ffff
+/// let parts = partition::by_uuid_range("SELECT id FROM t", "id", lo, hi, 2);
+/// assert_eq!(parts.len(), 2);
+/// // The cut point is MAX/2 = 0x7fff…ffff (half-open boundaries, gap-free).
+/// assert_eq!(
+///     parts[0].sql,
+///     "SELECT * FROM (SELECT id FROM t) AS _part WHERE id >= '00000000-0000-0000-0000-000000000000' \
+///      AND id < '7fffffff-ffff-ffff-ffff-ffffffffffff'"
+/// );
+/// ```
+pub fn by_uuid_range(
+    base_sql: &str,
+    key_column: &str,
+    min: Uuid,
+    max: Uuid,
+    partitions: u32,
+) -> Vec<Partition> {
+    let (min_u, max_u) = (min.as_u128(), max.as_u128());
+    if partitions == 0 || min_u > max_u {
+        return Vec::new();
+    }
+
+    let base = clean(base_sql);
+    let n = partitions as u128;
+    // Half-open value boundaries across the inclusive interval [min, max].
+    // boundary(0) == min, boundary(n) == max; partition i spans
+    // [boundary(i), boundary(i + 1)).
+    let span = max_u - min_u;
+    let boundary = |k: u128| min_u + mul_div(span, k, n);
+
+    let mut out = Vec::with_capacity(partitions as usize);
+    for i in 0..n {
+        let lo = boundary(i);
+        let hi = boundary(i + 1);
+        let lo_uuid = Uuid::from_u128(lo);
+        if i + 1 == n {
+            // Last partition: close the interval inclusively at max.
+            if lo > max_u {
+                continue;
+            }
+            out.push(Partition::new(format!(
+                "SELECT * FROM ({base}) AS _part WHERE {key_column} >= '{lo_uuid}' \
+                 AND {key_column} <= '{max}'"
+            )));
+        } else {
+            if lo >= hi {
+                // Empty slice — more partitions than distinct values.
+                continue;
+            }
+            let hi_uuid = Uuid::from_u128(hi);
+            out.push(Partition::new(format!(
+                "SELECT * FROM ({base}) AS _part WHERE {key_column} >= '{lo_uuid}' \
+                 AND {key_column} < '{hi_uuid}'"
+            )));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +318,88 @@ mod tests {
             parts[0].sql,
             "SELECT * FROM (SELECT * FROM t) AS _part WHERE id BETWEEN 1 AND 2"
         );
+    }
+
+    #[test]
+    fn uuid_range_tiles_full_space_without_gaps() {
+        let lo = Uuid::from_u128(0);
+        let hi = Uuid::from_u128(u128::MAX);
+        let parts = by_uuid_range("SELECT id FROM t", "id", lo, hi, 4);
+        assert_eq!(parts.len(), 4);
+        // Half-open boundaries at MAX*k/4 → 0x3fff…, 0x7fff…, 0xbfff…; the last
+        // range closes inclusively at max.
+        assert!(parts[0]
+            .sql
+            .contains("id >= '00000000-0000-0000-0000-000000000000' AND id < '3fffffff"));
+        assert!(parts[1].sql.contains("id >= '3fffffff"));
+        assert!(parts[2].sql.contains("id >= '7fffffff"));
+        assert!(parts[3].sql.contains("id >= 'bfffffff"));
+        assert!(parts[3]
+            .sql
+            .ends_with("AND id <= 'ffffffff-ffff-ffff-ffff-ffffffffffff'"));
+    }
+
+    #[test]
+    fn uuid_range_boundaries_are_contiguous() {
+        // The high bound of partition i must equal the low bound of partition i+1.
+        let parts = by_uuid_range(
+            "SELECT id FROM t",
+            "id",
+            Uuid::from_u128(0),
+            Uuid::from_u128(u128::MAX),
+            3,
+        );
+        assert_eq!(parts.len(), 3);
+        // partition 0 upper bound:
+        assert!(parts[0]
+            .sql
+            .contains("AND id < '55555555-5555-5555-5555-555555555555'"));
+        // partition 1 lower bound matches partition 0 upper bound:
+        assert!(parts[1]
+            .sql
+            .contains("id >= '55555555-5555-5555-5555-555555555555'"));
+    }
+
+    #[test]
+    fn uuid_range_single_partition_is_inclusive() {
+        let lo = Uuid::from_u128(10);
+        let hi = Uuid::from_u128(20);
+        let parts = by_uuid_range("SELECT id FROM t", "id", lo, hi, 1);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].sql,
+            format!(
+                "SELECT * FROM (SELECT id FROM t) AS _part WHERE id >= '{lo}' AND id <= '{hi}'"
+            )
+        );
+    }
+
+    #[test]
+    fn uuid_range_skips_empty_slices() {
+        // Three distinct values but ten partitions → at most a handful of ranges,
+        // and never more than requested.
+        let parts = by_uuid_range(
+            "SELECT id FROM t",
+            "id",
+            Uuid::from_u128(0),
+            Uuid::from_u128(2),
+            10,
+        );
+        assert!(!parts.is_empty());
+        assert!(parts.len() <= 10);
+        // The final partition still closes inclusively at max.
+        assert!(parts
+            .last()
+            .unwrap()
+            .sql
+            .ends_with("AND id <= '00000000-0000-0000-0000-000000000002'"));
+    }
+
+    #[test]
+    fn uuid_range_edge_cases() {
+        let a = Uuid::from_u128(5);
+        let b = Uuid::from_u128(4);
+        assert!(by_uuid_range("SELECT 1", "id", a, b, 4).is_empty()); // min > max
+        assert!(by_uuid_range("SELECT 1", "id", b, a, 0).is_empty()); // zero partitions
     }
 }

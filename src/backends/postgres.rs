@@ -152,6 +152,11 @@ fn pg_row_to_row(row: &PgRow) -> Result<Row, DbError> {
 }
 
 fn build_pg_tls(trust_cert: bool) -> tokio_postgres_rustls::MakeRustlsConnect {
+    // rustls 0.23 requires a process-wide crypto provider before a ClientConfig
+    // can be built. Install ring; this is idempotent and harmless if another
+    // provider was already installed (e.g. by a different backend).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let config = if trust_cert {
         rustls::ClientConfig::builder()
             .dangerous()

@@ -1,0 +1,87 @@
+name: Functional tests
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit:
+    name: unit + doc tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Unit tests
+        run: cargo test --features postgres,mysql,mssql,azure-auth --lib
+      - name: Doc tests
+        run: cargo test --features postgres,mysql,mssql,azure-auth --doc
+
+  postgres-functional:
+    name: postgres functional
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PG_HOST: localhost
+      PG_PORT: 5432
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      PG_DB: testdb
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Seed database
+        run: |
+          PGPASSWORD=$PG_PASSWORD psql -h $PG_HOST -p $PG_PORT -U $PG_USER -d $PG_DB \
+            -v ON_ERROR_STOP=1 -f test/sql/seed_postgres.sql
+
+      - name: Run PostgreSQL integration tests
+        run: cargo test --test test_postgres --features postgres -- --ignored --nocapture
+
+      # End-to-end DuckDB smoke: load the built extension and query Postgres
+      # through postgres_query. Best-effort — requires the loadable extension to
+      # be built by the distribution pipeline; skipped if EXT_PATH is unset.
+      - name: DuckDB end-to-end smoke (optional)
+        if: ${{ env.EXT_PATH != '' }}
+        run: |
+          python3 -m pip install --quiet duckdb
+          PG_CONN="host=$PG_HOST port=$PG_PORT dbname=$PG_DB user=$PG_USER password=$PG_PASSWORD sslmode=disable" \
+            python3 scripts/duckdb_smoke.py

@@ -4,11 +4,11 @@
 
 #[cfg(feature = "mssql")]
 mod tests {
-    use db_driver::{AuthConfig, DatabaseConfig, DbDriver, MssqlDriver, PoolConfig, Value};
+    use rust_db_driver::{AuthConfig, DatabaseConfig, DbDriver, MssqlDriver, PoolConfig, Value};
     use std::time::Duration;
 
     fn test_config() -> DatabaseConfig {
-        let auth = AuthConfig::SqlPassword(db_driver::auth::SqlAuth::new(
+        let auth = AuthConfig::SqlPassword(rust_db_driver::auth::SqlAuth::new(
             std::env::var("MSSQL_USER").unwrap_or_else(|_| "sa".to_string()),
             std::env::var("MSSQL_PASSWORD").unwrap_or_else(|_| "YourStrong!Passw0rd".to_string()),
         ));
