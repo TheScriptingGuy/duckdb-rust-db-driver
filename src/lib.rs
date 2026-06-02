@@ -10,7 +10,7 @@ pub mod row;
 pub mod vtab;
 
 pub use config::{BackendType, DatabaseConfig};
-pub use driver::{DbDriver, Partition};
+pub use driver::{DbDriver, Partition, RowStream};
 pub use error::DbError;
 pub use pool::PoolConfig;
 pub use row::{Column, Row, Value};

@@ -231,8 +231,16 @@ generated SQL is injection-safe:
 | Helper | Strategy | Use when |
 |---|---|---|
 | `partition::by_int_range(sql, key, min, max, n)` | tile `[min, max]` into `n` `BETWEEN` ranges on an integer key | you have an indexed numeric key and know its bounds |
-| `partition::by_uuid_range(sql, key, min, max, n)` | tile the 128-bit UUID space into `n` `>= / <` ranges | the key is a UUID **and** the backend orders UUIDs by byte value (see below) |
+| `partition::by_uuid_range(sql, key, min, max, n)` | tile the 128-bit UUID space into `n` `>= / <` ranges (byte order) | the key is a UUID and the backend orders UUIDs by byte value (PostgreSQL/MySQL/DuckDB) |
+| `partition::by_uuid_range_ordered(sql, key, min, max, n, order)` | same, but slice in the backend's own UUID ordering | the key is a SQL Server `uniqueidentifier` (pass `UuidOrder::SqlServer`) |
+| `partition::by_date_range(sql, key, min, max, n)` | tile a `DATE` interval into `n` day-aligned ranges | partitioning on a `DATE` column |
+| `partition::by_datetime_range(sql, key, min, max, n)` | tile a naive `DATETIME`/`TIMESTAMP` interval into `n` ranges | partitioning on a timezone-naive timestamp |
+| `partition::by_timestamp_range(sql, key, min, max, n)` | tile a UTC `TIMESTAMPTZ`/`datetimeoffset` interval into `n` ranges | partitioning on a timezone-aware timestamp |
 | `partition::by_offset(sql, order_by, total, n)` | `LIMIT`/`OFFSET` paging | no key available (needs a stable `ORDER BY`; large offsets get costlier) |
+
+The date/time helpers tile with half-open `key >= lo AND key < hi` predicates
+(the last partition closes inclusively on `max`) so rows that land exactly on a
+boundary are counted once.
 
 ```rust
 use rust_db_driver::{partition, DbDriver};
@@ -263,9 +271,11 @@ UUID range partitioning is only correct where the backend compares UUIDs in
 - **PostgreSQL `uuid`** — byte-ordered ✅
 - **MySQL** `BINARY(16)`, or lowercase canonical `CHAR(36)` under a binary/ascii
   collation ✅
-- **SQL Server `uniqueidentifier`** — uses a *different* comparison order, so
-  range slicing can drop/duplicate rows ❌ — use `by_offset`, or partition on an
-  integer column / `cast(... as bigint)` expression instead.
+- **SQL Server `uniqueidentifier`** — uses a *different* comparison order (node
+  bytes most significant, first three groups byte-reversed), so plain
+  `by_uuid_range` can drop/duplicate rows ❌. Use
+  `by_uuid_range_ordered(sql, key, min, max, n, UuidOrder::SqlServer)`, which
+  slices the space in `uniqueidentifier` order so the ranges tile correctly.
 
 ### From DuckDB SQL
 
@@ -347,6 +357,18 @@ Where the parallelism actually happens is worth being precise about:
   concurrently on a multi-threaded Tokio runtime, so the expensive part — the
   round-trips to the remote database — overlaps across connections. This is the
   win that matters for large scans.
+- **Rows can be surfaced incrementally** from the library with
+  `DbDriver::query_partitioned_stream`, which returns a `RowStream` and yields
+  rows in partition order as each partition resolves — same concurrency, but a
+  lower time-to-first-row and no need to buffer the whole result set:
+
+  ```rust
+  use futures::StreamExt;
+  let mut stream = driver.query_partitioned_stream(&parts);
+  while let Some(row) = stream.next().await {
+      process(row?); // a partition's failure surfaces as an Err item in place
+  }
+  ```
 - **DuckDB scan-out is single-threaded**, by binding limitation. DuckDB's C API
   only parallelises a table function's `func()` across threads when the function
   registers a *local-init* (per-thread) callback; the `duckdb-rs` `VTab`
