@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
+use crate::driver::Partition;
 use crate::row::{Row, Value};
 
 // ── Singleton tokio runtime ────────────────────────────────────────────────
@@ -23,10 +24,58 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 // ── Backend connector trait ────────────────────────────────────────────────
 
 pub trait BackendConnector: 'static {
+    /// Connect, then run every partition concurrently over a pool sized to
+    /// `max_connections`, returning the concatenated rows. A non-partitioned
+    /// call is just a single-element `partitions` slice with `max_connections`
+    /// of 1.
     fn connect_and_query(
         conn_str: &str,
-        query: &str,
+        partitions: Vec<Partition>,
+        max_connections: u32,
     ) -> Result<Vec<Row>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Build the partition list from the table function's named parameters.
+///
+/// Returns a single-element list wrapping the original `query` when no
+/// partitioning parameters are supplied (or when the supplied values produce no
+/// partitions), so the caller always has at least one statement to run.
+fn build_partitions(query: &str, bind: &BindInfo) -> Vec<Partition> {
+    let count = bind.get_named_parameter("partitions").map(|v| v.to_int64());
+
+    // Range strategy: split an integer key column across [min, max].
+    if let (Some(key), Some(n), Some(min), Some(max)) = (
+        bind.get_named_parameter("partition_key")
+            .map(|v| v.to_string()),
+        count,
+        bind.get_named_parameter("partition_min")
+            .map(|v| v.to_int64()),
+        bind.get_named_parameter("partition_max")
+            .map(|v| v.to_int64()),
+    ) {
+        if n > 0 {
+            let parts = crate::partition::by_int_range(query, &key, min, max, n as u32);
+            if !parts.is_empty() {
+                return parts;
+            }
+        }
+    }
+
+    // Offset strategy: LIMIT/OFFSET paging over a stable ORDER BY.
+    if let (Some(order_by), Some(n), Some(total)) = (
+        bind.get_named_parameter("order_by").map(|v| v.to_string()),
+        count,
+        bind.get_named_parameter("total_rows").map(|v| v.to_int64()),
+    ) {
+        if n > 0 && total > 0 {
+            let parts = crate::partition::by_offset(query, &order_by, total as u64, n as u32);
+            if !parts.is_empty() {
+                return parts;
+            }
+        }
+    }
+
+    vec![Partition::new(query)]
 }
 
 // ── Shared bind / init data ────────────────────────────────────────────────
@@ -59,7 +108,12 @@ impl<C: BackendConnector + Send + Sync> VTab for RemoteVTab<C> {
         let conn_str = bind.get_parameter(0).to_string();
         let query = bind.get_parameter(1).to_string();
 
-        let rows = C::connect_and_query(&conn_str, &query)
+        let partitions = build_partitions(&query, bind);
+        // One connection per partition (capped) so they actually run in
+        // parallel; query_partitioned will queue any excess against the pool.
+        let max_connections = partitions.len().clamp(1, 32) as u32;
+
+        let rows = C::connect_and_query(&conn_str, partitions, max_connections)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::from(e.to_string()) })?;
 
         let col_count = rows.first().map(|r| r.column_count()).unwrap_or(0);
@@ -119,6 +173,38 @@ impl<C: BackendConnector + Send + Sync> VTab for RemoteVTab<C> {
         Some(vec![
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        ])
+    }
+
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        Some(vec![
+            // Shared across both strategies.
+            (
+                "partitions".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ),
+            // Range strategy.
+            (
+                "partition_key".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "partition_min".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ),
+            (
+                "partition_max".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ),
+            // Offset strategy.
+            (
+                "order_by".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "total_rows".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ),
         ])
     }
 }
@@ -206,7 +292,8 @@ pub struct PostgresConnector;
 impl BackendConnector for PostgresConnector {
     fn connect_and_query(
         conn_str: &str,
-        query: &str,
+        partitions: Vec<Partition>,
+        max_connections: u32,
     ) -> Result<Vec<Row>, Box<dyn std::error::Error + Send + Sync>> {
         use crate::auth::AuthConfig;
         use crate::backends::postgres::PostgresDriver;
@@ -233,15 +320,14 @@ impl BackendConnector for PostgresConnector {
         config.trust_cert = true;
         config.pool = PoolConfig {
             min_connections: 0,
-            max_connections: 1,
+            max_connections,
             ..Default::default()
         };
 
-        let query = query.to_string();
         runtime()
             .block_on(async move {
                 let driver = PostgresDriver::connect(&config).await?;
-                driver.query(&query, &[]).await
+                driver.query_partitioned(&partitions).await
             })
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
@@ -254,7 +340,8 @@ pub struct MySqlConnector;
 impl BackendConnector for MySqlConnector {
     fn connect_and_query(
         conn_str: &str,
-        query: &str,
+        partitions: Vec<Partition>,
+        max_connections: u32,
     ) -> Result<Vec<Row>, Box<dyn std::error::Error + Send + Sync>> {
         use crate::auth::AuthConfig;
         use crate::backends::mysql::MySqlDriver;
@@ -266,15 +353,14 @@ impl BackendConnector for MySqlConnector {
             DatabaseConfig::mysql("", 3306, "", AuthConfig::None).with_connection_string(conn_str);
         config.pool = PoolConfig {
             min_connections: 0,
-            max_connections: 1,
+            max_connections,
             ..Default::default()
         };
 
-        let query = query.to_string();
         runtime()
             .block_on(async move {
                 let driver = MySqlDriver::connect(&config).await?;
-                driver.query(&query, &[]).await
+                driver.query_partitioned(&partitions).await
             })
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
@@ -287,17 +373,20 @@ pub struct MssqlConnector;
 impl BackendConnector for MssqlConnector {
     fn connect_and_query(
         conn_str: &str,
-        query: &str,
+        partitions: Vec<Partition>,
+        max_connections: u32,
     ) -> Result<Vec<Row>, Box<dyn std::error::Error + Send + Sync>> {
         use crate::backends::mssql::MssqlDriver;
         use crate::driver::DbDriver;
 
-        let config = parse_mssql_conn_str(conn_str)?;
-        let query = query.to_string();
+        let mut config = parse_mssql_conn_str(conn_str)?;
+        config.pool.min_connections = 0;
+        config.pool.max_connections = max_connections;
+
         runtime()
             .block_on(async move {
                 let driver = MssqlDriver::connect(&config).await?;
-                driver.query(&query, &[]).await
+                driver.query_partitioned(&partitions).await
             })
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }

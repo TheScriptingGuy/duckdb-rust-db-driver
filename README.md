@@ -192,9 +192,11 @@ cached token instead of each fetching their own.
 
 ### Pooling inside the DuckDB extension
 
-When invoked **as a DuckDB table function**, each call currently opens a
-short-lived pool sized to a single connection (`min=0, max=1`) for the duration
-of that one query, then tears it down. The full pool machinery above is what the
+When invoked **as a DuckDB table function**, each call opens a short-lived pool
+for the duration of that one statement and tears it down afterwards. Without
+partitioning the pool holds a single connection (`min=0, max=1`); when you ask
+for partitioning (see below) the pool is sized to one connection per partition
+so they can run concurrently. The full pool machinery above is what the
 **library API and the examples** exercise, where a long-lived driver amortises
 connection cost across many queries.
 
@@ -245,6 +247,52 @@ let rows = driver.query_partitioned(&parts).await?;
 You can also hand-build `Partition::new(sql)` / `Partition::with_params(sql,
 params)` if you have your own partitioning scheme. See
 `examples/partitioned_query.rs` for a runnable end-to-end example.
+
+### From DuckDB SQL
+
+The table functions expose partitioning through **named parameters** — pass none
+and you get the normal single-connection behaviour; pass them and the extension
+builds the partitions, sizes the pool to one connection per partition, and runs
+them concurrently before streaming the combined result into DuckDB.
+
+| Named parameter | Type | Strategy | Meaning |
+|---|---|---|---|
+| `partitions`    | `BIGINT`  | both   | number of partitions to split into |
+| `partition_key` | `VARCHAR` | range  | integer key column to split on |
+| `partition_min` | `BIGINT`  | range  | lowest key value (inclusive) |
+| `partition_max` | `BIGINT`  | range  | highest key value (inclusive) |
+| `order_by`      | `VARCHAR` | offset | stable ordering expression for paging |
+| `total_rows`    | `BIGINT`  | offset | total rows to page through |
+
+**Range strategy** — split an integer key into N parallel scans:
+
+```sql
+SELECT * FROM postgres_query(
+    'host=db.example.com user=app password=secret dbname=sales',
+    'SELECT id, total FROM orders WHERE total > 100',
+    partition_key = 'id',
+    partition_min = 1,
+    partition_max = 1000000,
+    partitions    = 8
+);
+```
+
+**Offset strategy** — page through an ordered result when there is no key:
+
+```sql
+SELECT * FROM mysql_query(
+    'mysql://app:secret@db.example.com/sales',
+    'SELECT * FROM events',
+    order_by   = 'ts, id',
+    total_rows = 500000,
+    partitions = 4
+);
+```
+
+The same named parameters work on `mysql_query` and `mssql_query`. If the
+partitioning parameters are missing or incomplete the extension falls back to
+running the query as-is on a single connection, so existing two-argument calls
+are unaffected.
 
 > **When it pays off:** partitioning helps when the *backend* is the bottleneck
 > and allows concurrent sessions. Size `n` at or below the pool's
