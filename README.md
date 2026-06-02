@@ -200,6 +200,60 @@ connection cost across many queries.
 
 ---
 
+## Parallel partitioned queries
+
+The pool lets you run **one logical query as several partitions in parallel**.
+`DbDriver::query_partitioned` takes a list of `Partition`s (each a self-contained
+SQL statement + optional params) and dispatches each as its own `query`:
+
+```rust
+async fn query_partitioned(&self, partitions: &[Partition]) -> Result<Vec<Row>, DbError>;
+```
+
+Because every partition goes through the normal `query` path, each one acquires
+its own pooled connection and they execute **concurrently** — the queries
+overlap their network/IO waits instead of running back to back. Concurrency is
+bounded automatically by the pool's `max_connections`: more partitions than
+connections simply queue for a free connection rather than swamping the backend.
+Results are concatenated in **partition order**, so the output is deterministic
+regardless of which partition finishes first, and if any partition fails the
+whole call fails.
+
+### Building partitions
+
+SQL has no generic, safe way to "cut a query into N", so the `partition` module
+wraps your query as a subselect and adds a slicing predicate. Both helpers embed
+only integer literals (never caller text), so the generated SQL is
+injection-safe and backend-agnostic:
+
+| Helper | Strategy | Use when |
+|---|---|---|
+| `partition::by_int_range(sql, key, min, max, n)` | tile `[min, max]` into `n` `BETWEEN` ranges on an integer key | you have an indexed numeric key and know its bounds |
+| `partition::by_offset(sql, order_by, total, n)` | `LIMIT`/`OFFSET` paging | no key available (needs a stable `ORDER BY`; large offsets get costlier) |
+
+```rust
+use rust_db_driver::{partition, DbDriver};
+
+// Split SELECT … over id ∈ [1, 1_000_000] into 8 parallel range scans.
+let parts = partition::by_int_range(
+    "SELECT id, total FROM orders WHERE total > 100",
+    "id", 1, 1_000_000, 8,
+);
+let rows = driver.query_partitioned(&parts).await?;
+```
+
+You can also hand-build `Partition::new(sql)` / `Partition::with_params(sql,
+params)` if you have your own partitioning scheme. See
+`examples/partitioned_query.rs` for a runnable end-to-end example.
+
+> **When it pays off:** partitioning helps when the *backend* is the bottleneck
+> and allows concurrent sessions. Size `n` at or below the pool's
+> `max_connections` and within the backend's session limit (e.g. Azure SQL
+> Basic/S0 ≈ 30 sessions). For small results the fan-out overhead can outweigh
+> the gain.
+
+---
+
 ## Using it as a Rust library
 
 ```rust

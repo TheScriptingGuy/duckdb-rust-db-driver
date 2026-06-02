@@ -17,6 +17,11 @@ path = "examples/postgres_pool.rs"
 required-features = ["postgres"]
 
 [[example]]
+name = "partitioned_query"
+path = "examples/partitioned_query.rs"
+required-features = ["postgres"]
+
+[[example]]
 name = "azure_sql_aad"
 path = "examples/azure_sql_aad.rs"
 required-features = ["mssql", "azure-auth"]
