@@ -4,12 +4,13 @@ pub mod config;
 pub mod driver;
 pub mod error;
 pub mod extension;
+pub mod partition;
 pub mod pool;
 pub mod row;
 pub mod vtab;
 
 pub use config::{BackendType, DatabaseConfig};
-pub use driver::DbDriver;
+pub use driver::{DbDriver, Partition};
 pub use error::DbError;
 pub use pool::PoolConfig;
 pub use row::{Column, Row, Value};
