@@ -8,7 +8,9 @@
 #[cfg(feature = "postgres")]
 #[tokio::main]
 async fn main() -> Result<(), rust_db_driver::DbError> {
-    use rust_db_driver::{partition, AuthConfig, DatabaseConfig, DbDriver, PoolConfig, PostgresDriver};
+    use rust_db_driver::{
+        partition, AuthConfig, DatabaseConfig, DbDriver, PoolConfig, PostgresDriver,
+    };
     use std::time::Duration;
 
     let auth = AuthConfig::SqlPassword(rust_db_driver::auth::SqlAuth::new(
