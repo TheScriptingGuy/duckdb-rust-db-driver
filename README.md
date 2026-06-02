@@ -455,8 +455,8 @@ docker compose up -d                # spin up postgres / mysql / mssql
 
 ## Functional testing
 
-`scripts/run_functional_tests.sh` validates the **PostgreSQL** path end to end
-against a real database. It:
+`scripts/run_functional_tests.sh` validates the **PostgreSQL** and **SQL
+Server** paths end to end against real databases. It:
 
 1. brings up PostgreSQL (via `docker compose`, or uses an existing server when
    `PG_HOST` is set) and seeds it from `test/sql/seed_postgres.sql`;
@@ -467,14 +467,21 @@ against a real database. It:
 3. if the `duckdb` Python module is installed, builds and packages the loadable
    extension and runs `scripts/duckdb_smoke.py`, which **loads the extension
    into DuckDB and queries Postgres through `postgres_query`** (plain,
-   integer-partitioned, and UUID-partitioned).
+   integer-partitioned, and UUID-partitioned);
+4. unless `RUN_MSSQL=no`, brings up SQL Server, seeds it from
+   `test/sql/seed_mssql.sql`, and runs `tests/test_mssql.rs`. These cover the
+   integer-range, datetime-range, and streaming paths, and crucially the
+   **`uniqueidentifier`-ordered UUID partitioning** (`by_uuid_range_ordered`
+   with `UuidOrder::SqlServer`): one test asserts it covers every row exactly
+   once, and a contrast test asserts that *lexical* slicing mis-tiles the same
+   column — proving the SQL Server ordering is required.
 
 ```bash
-# One-shot, using docker compose for Postgres:
+# One-shot, using docker compose for Postgres + SQL Server:
 scripts/run_functional_tests.sh
 
-# Against an already-running Postgres, skipping docker:
-USE_DOCKER=no PG_HOST=127.0.0.1 PG_USER=postgres PG_PASSWORD=postgres PG_DB=testdb \
+# Against an already-running Postgres, skipping docker (and SQL Server):
+USE_DOCKER=no RUN_MSSQL=no PG_HOST=127.0.0.1 PG_USER=postgres PG_PASSWORD=postgres PG_DB=testdb \
   scripts/run_functional_tests.sh
 ```
 
@@ -483,7 +490,8 @@ run them directly with:
 
 ```bash
 cargo test --test test_postgres --features postgres -- --ignored
+cargo test --test test_mssql --features mssql -- --ignored
 ```
 
 CI runs the same flow in `.github/workflows/functional.yml` against a
-`postgres:16` service.
+`postgres:16` service and a `mssql/server:2022-latest` service.

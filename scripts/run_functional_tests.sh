@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Functional test harness for the PostgreSQL path.
+# Functional test harness for the PostgreSQL and SQL Server paths.
 #
-# Brings up a PostgreSQL instance, seeds it, then validates the driver +
-# partitioning logic at two levels:
-#   1. Rust integration tests  (tests/test_postgres.rs)   — always run
-#   2. DuckDB end-to-end smoke  (scripts/duckdb_smoke.py)  — run when an
+# Brings up the databases, seeds them, then validates the driver +
+# partitioning logic at several levels:
+#   1. PostgreSQL integration tests (tests/test_postgres.rs) — always run
+#   2. DuckDB end-to-end smoke (scripts/duckdb_smoke.py)     — when an
 #      extension build and the `duckdb` python module are available
+#   3. SQL Server integration tests (tests/test_mssql.rs)    — opt-in; covers
+#      the uniqueidentifier-ordered UUID partitioning. Set RUN_MSSQL=no to skip.
 #
 # Usage:
 #   scripts/run_functional_tests.sh                # uses docker compose
 #   PG_HOST=127.0.0.1 scripts/run_functional_tests.sh   # use an existing PG
 #   EXT_PATH=path/to/ext scripts/run_functional_tests.sh  # also run DuckDB smoke
+#   RUN_MSSQL=no scripts/run_functional_tests.sh    # skip SQL Server tests
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -89,6 +92,59 @@ if python3 -c "import duckdb" >/dev/null 2>&1; then
     EXT_PATH="$EXT_PATH" python3 scripts/duckdb_smoke.py
 else
   echo "==> skipping DuckDB smoke (install the duckdb python module to enable)"
+fi
+
+# ── 5. SQL Server functional tests (opt-in) ─────────────────────────────────
+# Runs when RUN_MSSQL is yes/auto and either a server is reachable or docker is
+# available to start one. Set RUN_MSSQL=no to skip entirely.
+RUN_MSSQL="${RUN_MSSQL:-auto}"
+MSSQL_HOST="${MSSQL_HOST:-127.0.0.1}"
+MSSQL_PORT="${MSSQL_PORT:-1433}"
+MSSQL_USER="${MSSQL_USER:-sa}"
+MSSQL_PASSWORD="${MSSQL_PASSWORD:-YourStrong!Passw0rd}"
+MSSQL_DB="${MSSQL_DB:-testdb}"
+
+# Run sqlcmd, preferring a host install and falling back to the compose
+# container's bundled mssql-tools18.
+mssql_cmd() {
+  if command -v sqlcmd >/dev/null 2>&1; then
+    sqlcmd -S "${MSSQL_HOST},${MSSQL_PORT}" -U "$MSSQL_USER" -P "$MSSQL_PASSWORD" -C "$@"
+  else
+    docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
+      -S localhost -U "$MSSQL_USER" -P "$MSSQL_PASSWORD" -C "$@"
+  fi
+}
+mssql_ready() { mssql_cmd -b -Q "SELECT 1" >/dev/null 2>&1; }
+
+if [[ "$RUN_MSSQL" != "no" ]]; then
+  if ! mssql_ready && [[ "$USE_DOCKER" != "no" ]] && docker compose version >/dev/null 2>&1; then
+    echo "==> starting sql server via docker compose"
+    docker compose up -d mssql
+    started_docker=1
+    MSSQL_HOST=127.0.0.1
+    for _ in $(seq 1 40); do mssql_ready && break; sleep 3; done
+  fi
+
+  if mssql_ready; then
+    echo "==> sql server is ready at ${MSSQL_HOST}:${MSSQL_PORT}"
+    echo "==> seeding ${MSSQL_DB}"
+    # Pipe the seed in when seeding through the container (no shared filesystem).
+    if command -v sqlcmd >/dev/null 2>&1; then
+      mssql_cmd -b -i test/sql/seed_mssql.sql
+    else
+      docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
+        -S localhost -U "$MSSQL_USER" -P "$MSSQL_PASSWORD" -C -b < test/sql/seed_mssql.sql
+    fi
+    echo "==> running SQL Server integration tests"
+    MSSQL_HOST="$MSSQL_HOST" MSSQL_PORT="$MSSQL_PORT" MSSQL_USER="$MSSQL_USER" \
+      MSSQL_PASSWORD="$MSSQL_PASSWORD" MSSQL_DB="$MSSQL_DB" \
+      cargo test --test test_mssql --features mssql -- --ignored --nocapture
+  elif [[ "$RUN_MSSQL" == "yes" ]]; then
+    echo "ERROR: RUN_MSSQL=yes but no reachable SQL Server at ${MSSQL_HOST}:${MSSQL_PORT}" >&2
+    exit 1
+  else
+    echo "==> skipping SQL Server tests (no reachable server; set RUN_MSSQL=yes to require)"
+  fi
 fi
 
 echo "==> functional tests passed"
