@@ -42,11 +42,32 @@ pub trait BackendConnector: 'static {
 /// partitions), so the caller always has at least one statement to run.
 fn build_partitions(query: &str, bind: &BindInfo) -> Vec<Partition> {
     let count = bind.get_named_parameter("partitions").map(|v| v.to_int64());
+    let key = bind
+        .get_named_parameter("partition_key")
+        .map(|v| v.to_string());
 
-    // Range strategy: split an integer key column across [min, max].
+    // UUID range strategy: split a UUID key over the 128-bit value space.
     if let (Some(key), Some(n), Some(min), Some(max)) = (
-        bind.get_named_parameter("partition_key")
-            .map(|v| v.to_string()),
+        key.as_deref(),
+        count,
+        bind.get_named_parameter("partition_uuid_min")
+            .map(|v| v.to_string())
+            .and_then(|s| uuid::Uuid::parse_str(&s).ok()),
+        bind.get_named_parameter("partition_uuid_max")
+            .map(|v| v.to_string())
+            .and_then(|s| uuid::Uuid::parse_str(&s).ok()),
+    ) {
+        if n > 0 {
+            let parts = crate::partition::by_uuid_range(query, key, min, max, n as u32);
+            if !parts.is_empty() {
+                return parts;
+            }
+        }
+    }
+
+    // Integer range strategy: split an integer key column across [min, max].
+    if let (Some(key), Some(n), Some(min), Some(max)) = (
+        key.as_deref(),
         count,
         bind.get_named_parameter("partition_min")
             .map(|v| v.to_int64()),
@@ -54,7 +75,7 @@ fn build_partitions(query: &str, bind: &BindInfo) -> Vec<Partition> {
             .map(|v| v.to_int64()),
     ) {
         if n > 0 {
-            let parts = crate::partition::by_int_range(query, &key, min, max, n as u32);
+            let parts = crate::partition::by_int_range(query, key, min, max, n as u32);
             if !parts.is_empty() {
                 return parts;
             }
@@ -183,7 +204,7 @@ impl<C: BackendConnector + Send + Sync> VTab for RemoteVTab<C> {
                 "partitions".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Bigint),
             ),
-            // Range strategy.
+            // Range strategies (integer + UUID share partition_key).
             (
                 "partition_key".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
@@ -195,6 +216,14 @@ impl<C: BackendConnector + Send + Sync> VTab for RemoteVTab<C> {
             (
                 "partition_max".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ),
+            (
+                "partition_uuid_min".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "partition_uuid_max".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
             // Offset strategy.
             (

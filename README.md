@@ -224,13 +224,14 @@ whole call fails.
 ### Building partitions
 
 SQL has no generic, safe way to "cut a query into N", so the `partition` module
-wraps your query as a subselect and adds a slicing predicate. Both helpers embed
-only integer literals (never caller text), so the generated SQL is
-injection-safe and backend-agnostic:
+wraps your query as a subselect and adds a slicing predicate. The helpers embed
+only integer or canonical UUID literals (never caller row data), so the
+generated SQL is injection-safe:
 
 | Helper | Strategy | Use when |
 |---|---|---|
 | `partition::by_int_range(sql, key, min, max, n)` | tile `[min, max]` into `n` `BETWEEN` ranges on an integer key | you have an indexed numeric key and know its bounds |
+| `partition::by_uuid_range(sql, key, min, max, n)` | tile the 128-bit UUID space into `n` `>= / <` ranges | the key is a UUID **and** the backend orders UUIDs by byte value (see below) |
 | `partition::by_offset(sql, order_by, total, n)` | `LIMIT`/`OFFSET` paging | no key available (needs a stable `ORDER BY`; large offsets get costlier) |
 
 ```rust
@@ -248,6 +249,24 @@ You can also hand-build `Partition::new(sql)` / `Partition::with_params(sql,
 params)` if you have your own partitioning scheme. See
 `examples/partitioned_query.rs` for a runnable end-to-end example.
 
+#### UUID keys
+
+`by_int_range` is **integer-only**: its bounds are `i64` and the predicate is
+`BETWEEN <int> AND <int>`, so a 128-bit `UUID` neither fits the bounds nor
+compares against integer literals. Use `by_uuid_range` instead — it slices the
+full 128-bit value space and emits canonical lowercase UUID literals
+(`key >= '…' AND key < '…'`).
+
+UUID range partitioning is only correct where the backend compares UUIDs in
+**byte order**:
+
+- **PostgreSQL `uuid`** — byte-ordered ✅
+- **MySQL** `BINARY(16)`, or lowercase canonical `CHAR(36)` under a binary/ascii
+  collation ✅
+- **SQL Server `uniqueidentifier`** — uses a *different* comparison order, so
+  range slicing can drop/duplicate rows ❌ — use `by_offset`, or partition on an
+  integer column / `cast(... as bigint)` expression instead.
+
 ### From DuckDB SQL
 
 The table functions expose partitioning through **named parameters** — pass none
@@ -257,12 +276,18 @@ them concurrently before streaming the combined result into DuckDB.
 
 | Named parameter | Type | Strategy | Meaning |
 |---|---|---|---|
-| `partitions`    | `BIGINT`  | both   | number of partitions to split into |
-| `partition_key` | `VARCHAR` | range  | integer key column to split on |
-| `partition_min` | `BIGINT`  | range  | lowest key value (inclusive) |
-| `partition_max` | `BIGINT`  | range  | highest key value (inclusive) |
-| `order_by`      | `VARCHAR` | offset | stable ordering expression for paging |
-| `total_rows`    | `BIGINT`  | offset | total rows to page through |
+| `partitions`         | `BIGINT`  | all        | number of partitions to split into |
+| `partition_key`      | `VARCHAR` | int + uuid | key column to split on |
+| `partition_min`      | `BIGINT`  | int range  | lowest integer key value (inclusive) |
+| `partition_max`      | `BIGINT`  | int range  | highest integer key value (inclusive) |
+| `partition_uuid_min` | `VARCHAR` | uuid range | lowest UUID key value (inclusive) |
+| `partition_uuid_max` | `VARCHAR` | uuid range | highest UUID key value (inclusive) |
+| `order_by`           | `VARCHAR` | offset     | stable ordering expression for paging |
+| `total_rows`         | `BIGINT`  | offset     | total rows to page through |
+
+The strategy is chosen from which parameters you supply: UUID range (if
+`partition_uuid_min`/`max` parse) takes precedence, then integer range, then
+offset. A `partition_key` expression can be a bare column or any SQL expression.
 
 **Range strategy** — split an integer key into N parallel scans:
 
@@ -274,6 +299,20 @@ SELECT * FROM postgres_query(
     partition_min = 1,
     partition_max = 1000000,
     partitions    = 8
+);
+```
+
+**UUID range strategy** — split a UUID key over the 128-bit space (PostgreSQL /
+byte-ordered backends only):
+
+```sql
+SELECT * FROM postgres_query(
+    'host=db.example.com user=app password=secret dbname=sales',
+    'SELECT id, total FROM orders',
+    partition_key      = 'id',
+    partition_uuid_min = '00000000-0000-0000-0000-000000000000',
+    partition_uuid_max = 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+    partitions         = 8
 );
 ```
 
@@ -299,6 +338,30 @@ are unaffected.
 > `max_connections` and within the backend's session limit (e.g. Azure SQL
 > Basic/S0 ≈ 30 sessions). For small results the fan-out overhead can outweigh
 > the gain.
+
+### Streaming & threading model
+
+Where the parallelism actually happens is worth being precise about:
+
+- **Backend fetch is threaded.** `query_partitioned` runs the partitions
+  concurrently on a multi-threaded Tokio runtime, so the expensive part — the
+  round-trips to the remote database — overlaps across connections. This is the
+  win that matters for large scans.
+- **DuckDB scan-out is single-threaded**, by binding limitation. DuckDB's C API
+  only parallelises a table function's `func()` across threads when the function
+  registers a *local-init* (per-thread) callback; the `duckdb-rs` `VTab`
+  abstraction this extension builds on does not expose one, so `func()` is
+  driven from a single scan thread.
+- **Results are currently materialised** in `bind()` before DuckDB reads the
+  first row. Partitioning shortens the *fetch* phase but does not yet stream
+  rows through as they arrive.
+
+True per-row streaming (overlapping backend fetch with DuckDB consumption and
+bounding memory) is a planned follow-up: it needs row-streaming query methods on
+each backend (`tokio-postgres` portals, `sqlx` `fetch`, `tiberius` `QueryStream`)
+feeding a bounded channel that `func()` drains. In-DuckDB multi-threaded
+scan-out additionally needs raw-FFI local-init support beyond the current
+`duckdb-rs` `VTab` trait.
 
 ---
 
