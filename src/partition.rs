@@ -7,17 +7,21 @@
 //! lowercase UUID literals. None of them interpolate caller-supplied row data,
 //! so the generated SQL is injection-safe.
 //!
-//! Three strategies are provided:
+//! Several strategies are provided:
 //!
 //! * [`by_int_range`] — split on an integer key column. Predictable and
 //!   efficient when the key is indexed, but you must know the key's bounds.
 //! * [`by_uuid_range`] — split on a UUID key column over the 128-bit value
-//!   space. Correct only where the backend orders UUIDs by their byte value
-//!   (e.g. PostgreSQL `uuid`, MySQL `BINARY(16)` / lowercase `CHAR(36)`); see
-//!   the function docs for caveats.
+//!   space, assuming byte-value ordering (PostgreSQL `uuid`, MySQL
+//!   `BINARY(16)` / lowercase `CHAR(36)`). For SQL Server `uniqueidentifier`,
+//!   which compares GUIDs in a different byte order, use
+//!   [`by_uuid_range_ordered`] with [`UuidOrder::SqlServer`].
+//! * [`by_date_range`] / [`by_datetime_range`] / [`by_timestamp_range`] — split
+//!   on a `DATE` / naive `DATETIME` / timezone-aware `TIMESTAMP` key column.
 //! * [`by_offset`] — `LIMIT`/`OFFSET` paging. Works without a key, but needs a
 //!   stable `ORDER BY` and large offsets get progressively more expensive.
 
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use uuid::Uuid;
 
 use crate::driver::Partition;
@@ -155,8 +159,9 @@ fn mul_div(a: u128, num: u128, den: u128) -> u128 {
 /// * **MySQL** stored as `BINARY(16)`, or lowercase canonical `CHAR(36)` under a
 ///   binary/`ascii` collation — string comparison matches byte order. ✅
 /// * **SQL Server `uniqueidentifier`** — uses a *different* comparison order, so
-///   range slicing can drop or duplicate rows. ❌ Use [`by_offset`] instead, or
-///   partition on a different (integer) column.
+///   this byte-value slicing can drop or duplicate rows. ❌ Use
+///   [`by_uuid_range_ordered`] with [`UuidOrder::SqlServer`] instead, which
+///   slices in `uniqueidentifier` order.
 ///
 /// ```
 /// # use rust_db_driver::partition;
@@ -179,27 +184,123 @@ pub fn by_uuid_range(
     max: Uuid,
     partitions: u32,
 ) -> Vec<Partition> {
-    let (min_u, max_u) = (min.as_u128(), max.as_u128());
-    if partitions == 0 || min_u > max_u {
+    by_uuid_range_ordered(
+        base_sql,
+        key_column,
+        min,
+        max,
+        partitions,
+        UuidOrder::Lexical,
+    )
+}
+
+/// How a backend sorts/compares UUID values, which determines how
+/// [`by_uuid_range_ordered`] tiles the 128-bit key space.
+///
+/// SQL Server's `uniqueidentifier` does **not** compare GUIDs by their canonical
+/// big-endian value: it weighs the node bytes most significantly and
+/// byte-reverses the first three groups. Slicing lexically and handing the
+/// boundaries to a `uniqueidentifier` column would drop or duplicate rows, so
+/// SQL Server needs its own ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UuidOrder {
+    /// Canonical big-endian 128-bit ordering — the UUID compares as the integer
+    /// you read off its hex string left-to-right. PostgreSQL `uuid`, MySQL
+    /// `BINARY(16)`/lowercase `CHAR(36)`, DuckDB `UUID`. This is what plain
+    /// [`by_uuid_range`] uses.
+    Lexical,
+    /// SQL Server `uniqueidentifier` native ordering. The comparison weighs the
+    /// canonical bytes in this significance order (most significant first):
+    /// `10,11,12,13,14,15, 8,9, 7,6, 5,4, 3,2,1,0`.
+    SqlServer,
+}
+
+/// Canonical (RFC 4122) byte indices in SQL Server `uniqueidentifier`
+/// significance order, most significant first. Derived from .NET `SqlGuid`'s
+/// comparison order translated from its mixed-endian `ToByteArray()` layout back
+/// into canonical byte positions.
+const SQLSERVER_ORDER: [usize; 16] = [10, 11, 12, 13, 14, 15, 8, 9, 7, 6, 5, 4, 3, 2, 1, 0];
+
+/// Map a UUID to the unsigned 128-bit sort key the chosen backend orders by.
+fn uuid_to_key(u: Uuid, order: UuidOrder) -> u128 {
+    match order {
+        UuidOrder::Lexical => u.as_u128(),
+        UuidOrder::SqlServer => {
+            let b = u.as_bytes();
+            let mut key = 0u128;
+            for &idx in &SQLSERVER_ORDER {
+                key = (key << 8) | b[idx] as u128;
+            }
+            key
+        }
+    }
+}
+
+/// Inverse of [`uuid_to_key`]: rebuild the UUID from a backend sort key so the
+/// boundary can be emitted as a string literal the column compares cleanly.
+fn key_to_uuid(key: u128, order: UuidOrder) -> Uuid {
+    match order {
+        UuidOrder::Lexical => Uuid::from_u128(key),
+        UuidOrder::SqlServer => {
+            let kb = key.to_be_bytes();
+            let mut out = [0u8; 16];
+            for (i, &idx) in SQLSERVER_ORDER.iter().enumerate() {
+                out[idx] = kb[i];
+            }
+            Uuid::from_bytes(out)
+        }
+    }
+}
+
+/// Like [`by_uuid_range`], but slices the UUID space in the backend's own UUID
+/// ordering (`order`) rather than assuming byte-value order.
+///
+/// Pass [`UuidOrder::SqlServer`] for `uniqueidentifier` columns and
+/// [`UuidOrder::Lexical`] for PostgreSQL/MySQL/DuckDB. `min`/`max` are
+/// interpreted in the chosen ordering; boundaries are computed in that ordering's
+/// key space and converted back to UUID literals, so the half-open ranges tile
+/// `[min, max]` with no gaps or overlaps under that backend's comparison. Empty
+/// sub-ranges are skipped; `min > max` (in the chosen ordering) or
+/// `partitions == 0` yields an empty vector.
+///
+/// ```
+/// # use rust_db_driver::partition::{self, UuidOrder};
+/// # use uuid::Uuid;
+/// let parts = partition::by_uuid_range_ordered(
+///     "SELECT id FROM events", "id",
+///     Uuid::nil(), Uuid::max(), 4, UuidOrder::SqlServer,
+/// );
+/// assert_eq!(parts.len(), 4);
+/// ```
+pub fn by_uuid_range_ordered(
+    base_sql: &str,
+    key_column: &str,
+    min: Uuid,
+    max: Uuid,
+    partitions: u32,
+    order: UuidOrder,
+) -> Vec<Partition> {
+    let lo_key = uuid_to_key(min, order);
+    let hi_key = uuid_to_key(max, order);
+    if partitions == 0 || lo_key > hi_key {
         return Vec::new();
     }
 
     let base = clean(base_sql);
     let n = partitions as u128;
-    // Half-open value boundaries across the inclusive interval [min, max].
-    // boundary(0) == min, boundary(n) == max; partition i spans
-    // [boundary(i), boundary(i + 1)).
-    let span = max_u - min_u;
-    let boundary = |k: u128| min_u + mul_div(span, k, n);
+    // Half-open value boundaries across the inclusive interval [min, max] in the
+    // chosen ordering's key space: boundary(0) == lo_key, boundary(n) == hi_key.
+    let span = hi_key - lo_key;
+    let boundary = |k: u128| lo_key + mul_div(span, k, n);
 
     let mut out = Vec::with_capacity(partitions as usize);
     for i in 0..n {
         let lo = boundary(i);
         let hi = boundary(i + 1);
-        let lo_uuid = Uuid::from_u128(lo);
+        let lo_uuid = key_to_uuid(lo, order);
         if i + 1 == n {
             // Last partition: close the interval inclusively at max.
-            if lo > max_u {
+            if lo > hi_key {
                 continue;
             }
             out.push(Partition::new(format!(
@@ -211,7 +312,7 @@ pub fn by_uuid_range(
                 // Empty slice — more partitions than distinct values.
                 continue;
             }
-            let hi_uuid = Uuid::from_u128(hi);
+            let hi_uuid = key_to_uuid(hi, order);
             out.push(Partition::new(format!(
                 "SELECT * FROM ({base}) AS _part WHERE {key_column} >= '{lo_uuid}' \
                  AND {key_column} < '{hi_uuid}'"
@@ -219,6 +320,166 @@ pub fn by_uuid_range(
         }
     }
     out
+}
+
+/// Interpolate the `i`-th of `n` boundary offsets across a [`Duration`] span,
+/// preferring microsecond precision and falling back to seconds for spans too
+/// large to express in microseconds. `span` is assumed non-negative.
+fn split_duration(span: Duration, i: u32, n: u32) -> Duration {
+    if let Some(us) = span.num_microseconds() {
+        Duration::microseconds(mul_div(us as u128, i as u128, n as u128) as i64)
+    } else {
+        let s = span.num_seconds();
+        Duration::seconds(mul_div(s as u128, i as u128, n as u128) as i64)
+    }
+}
+
+/// Build half-open time partitions from pre-formatted ascending boundary
+/// literals (`bounds[0] == min` … `bounds[n] == max`).
+///
+/// Each partition `i` selects `[bounds[i], bounds[i+1])` with
+/// `key >= lo AND key < hi`, except the last, which closes inclusively
+/// (`<= max`) so the upper endpoint is not dropped. Empty slices (equal adjacent
+/// bounds) are skipped. Half-open intervals avoid the double-counting that
+/// inclusive `BETWEEN` would cause for continuous types where a row can land
+/// exactly on a boundary.
+fn time_partitions(base: &str, key_column: &str, bounds: &[String]) -> Vec<Partition> {
+    let n = bounds.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let lo = &bounds[i];
+        let hi = &bounds[i + 1];
+        let last = i + 1 == n;
+        if !last && lo == hi {
+            continue;
+        }
+        let pred = if last {
+            format!("{key_column} >= '{lo}' AND {key_column} <= '{hi}'")
+        } else {
+            format!("{key_column} >= '{lo}' AND {key_column} < '{hi}'")
+        };
+        out.push(Partition::new(format!(
+            "SELECT * FROM ({base}) AS _part WHERE {pred}"
+        )));
+    }
+    out
+}
+
+/// Split a query into contiguous ranges over a `DATE` key column.
+///
+/// The inclusive interval `[min, max]` is divided into (at most) `partitions`
+/// day-aligned sub-ranges using half-open `key >= 'lo' AND key < 'hi'` predicates
+/// (the last partition closes inclusively on `max`). Boundaries are emitted as
+/// `YYYY-MM-DD` literals. `min > max` or `partitions == 0` yields an empty
+/// vector.
+///
+/// ```
+/// # use rust_db_driver::partition;
+/// # use chrono::NaiveDate;
+/// let min = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+/// let max = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+/// let parts = partition::by_date_range("SELECT * FROM events", "day", min, max, 4);
+/// assert_eq!(parts.len(), 4);
+/// assert!(parts[0].sql.contains("day >= '2024-01-01' AND day < '2024-04-01'"));
+/// ```
+pub fn by_date_range(
+    base_sql: &str,
+    key_column: &str,
+    min: NaiveDate,
+    max: NaiveDate,
+    partitions: u32,
+) -> Vec<Partition> {
+    if partitions == 0 || min > max {
+        return Vec::new();
+    }
+    let base = clean(base_sql);
+    let span = (max - min).num_days().max(0) as u128;
+    let n = partitions;
+    let bounds: Vec<String> = (0..=n)
+        .map(|i| {
+            let days = mul_div(span, i as u128, n as u128) as i64;
+            (min + Duration::days(days)).format("%Y-%m-%d").to_string()
+        })
+        .collect();
+    time_partitions(base, key_column, &bounds)
+}
+
+/// Split a query into contiguous ranges over a naive `DATETIME` / `TIMESTAMP`
+/// (no time zone) key column.
+///
+/// The inclusive interval `[min, max]` is divided into (at most) `partitions`
+/// sub-ranges using half-open `key >= 'lo' AND key < 'hi'` predicates (the last
+/// closes inclusively on `max`). Boundaries are interpolated at microsecond
+/// precision and emitted as `YYYY-MM-DD HH:MM:SS.ffffff` literals. `min > max` or
+/// `partitions == 0` yields an empty vector.
+///
+/// ```
+/// # use rust_db_driver::partition;
+/// # use chrono::NaiveDate;
+/// let min = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+/// let max = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap().and_hms_opt(0, 0, 0).unwrap();
+/// let parts = partition::by_datetime_range("SELECT * FROM events", "ts", min, max, 2);
+/// assert_eq!(parts.len(), 2);
+/// ```
+pub fn by_datetime_range(
+    base_sql: &str,
+    key_column: &str,
+    min: NaiveDateTime,
+    max: NaiveDateTime,
+    partitions: u32,
+) -> Vec<Partition> {
+    if partitions == 0 || min > max {
+        return Vec::new();
+    }
+    let base = clean(base_sql);
+    let span = max - min;
+    let n = partitions;
+    let bounds: Vec<String> = (0..=n)
+        .map(|i| {
+            (min + split_duration(span, i, n))
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string()
+        })
+        .collect();
+    time_partitions(base, key_column, &bounds)
+}
+
+/// Split a query into contiguous ranges over a timezone-aware `TIMESTAMP` /
+/// `TIMESTAMPTZ` / `datetimeoffset` key column.
+///
+/// Identical tiling to [`by_datetime_range`], but boundaries carry a UTC offset
+/// and are emitted as `YYYY-MM-DD HH:MM:SS.ffffff+00:00`. `min > max` or
+/// `partitions == 0` yields an empty vector.
+///
+/// ```
+/// # use rust_db_driver::partition;
+/// # use chrono::{TimeZone, Utc};
+/// let min = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+/// let max = Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap();
+/// let parts = partition::by_timestamp_range("SELECT * FROM events", "ts", min, max, 2);
+/// assert_eq!(parts.len(), 2);
+/// ```
+pub fn by_timestamp_range(
+    base_sql: &str,
+    key_column: &str,
+    min: DateTime<Utc>,
+    max: DateTime<Utc>,
+    partitions: u32,
+) -> Vec<Partition> {
+    if partitions == 0 || min > max {
+        return Vec::new();
+    }
+    let base = clean(base_sql);
+    let span = max - min;
+    let n = partitions;
+    let bounds: Vec<String> = (0..=n)
+        .map(|i| {
+            (min + split_duration(span, i, n))
+                .format("%Y-%m-%d %H:%M:%S%.6f%:z")
+                .to_string()
+        })
+        .collect();
+    time_partitions(base, key_column, &bounds)
 }
 
 #[cfg(test)]
@@ -401,5 +662,157 @@ mod tests {
         let b = Uuid::from_u128(4);
         assert!(by_uuid_range("SELECT 1", "id", a, b, 4).is_empty()); // min > max
         assert!(by_uuid_range("SELECT 1", "id", b, a, 0).is_empty()); // zero partitions
+    }
+
+    // ----- SQL Server-ordered UUID partitioning ----------------------------
+
+    fn uuid(s: &str) -> Uuid {
+        Uuid::parse_str(s).unwrap()
+    }
+
+    #[test]
+    fn by_uuid_range_defaults_to_lexical() {
+        // The plain helper must be byte-identical to the ordered helper in
+        // Lexical mode (the contract the functional Postgres test relies on).
+        let lhs = by_uuid_range("SELECT id FROM t", "id", Uuid::nil(), Uuid::max(), 4);
+        let rhs = by_uuid_range_ordered(
+            "SELECT id FROM t",
+            "id",
+            Uuid::nil(),
+            Uuid::max(),
+            4,
+            UuidOrder::Lexical,
+        );
+        let l: Vec<&str> = lhs.iter().map(|p| p.sql.as_str()).collect();
+        let r: Vec<&str> = rhs.iter().map(|p| p.sql.as_str()).collect();
+        assert_eq!(l, r);
+    }
+
+    #[test]
+    fn uuid_key_roundtrips_through_both_orderings() {
+        let u = uuid("12345678-9abc-def0-1234-56789abcdef0");
+        for order in [UuidOrder::Lexical, UuidOrder::SqlServer] {
+            assert_eq!(key_to_uuid(uuid_to_key(u, order), order), u);
+        }
+    }
+
+    #[test]
+    fn sqlserver_orders_by_node_group_first() {
+        // The first node byte (canonical byte 10) dominates under SQL Server
+        // ordering, but is near-least-significant lexically — so the relation
+        // flips between the two orderings.
+        let node_high = uuid("00000000-0000-0000-0000-100000000000");
+        let first_high = uuid("10000000-0000-0000-0000-000000000000");
+        assert!(
+            uuid_to_key(node_high, UuidOrder::SqlServer)
+                > uuid_to_key(first_high, UuidOrder::SqlServer)
+        );
+        assert!(
+            uuid_to_key(node_high, UuidOrder::Lexical)
+                < uuid_to_key(first_high, UuidOrder::Lexical)
+        );
+    }
+
+    #[test]
+    fn sqlserver_uuid_partitions_tile_without_gaps() {
+        // Under SQL Server's own ordering the half-open ranges must be
+        // contiguous: each partition's upper bound equals the next lower bound.
+        let parts = by_uuid_range_ordered(
+            "SELECT * FROM t",
+            "id",
+            Uuid::nil(),
+            Uuid::max(),
+            8,
+            UuidOrder::SqlServer,
+        );
+        assert_eq!(parts.len(), 8);
+        let mut prev_hi: Option<u128> = None;
+        for (i, p) in parts.iter().enumerate() {
+            let (lo, hi) = extract_uuids(&p.sql);
+            let lo_k = uuid_to_key(lo, UuidOrder::SqlServer);
+            let hi_k = uuid_to_key(hi, UuidOrder::SqlServer);
+            assert!(lo_k <= hi_k);
+            if let Some(prev) = prev_hi {
+                assert_eq!(prev, lo_k, "ranges must be contiguous in SQL Server order");
+            }
+            prev_hi = Some(hi_k);
+            if i == 0 {
+                assert_eq!(lo_k, 0);
+            }
+            if i + 1 == parts.len() {
+                assert_eq!(hi_k, u128::MAX);
+            }
+        }
+    }
+
+    // Pull the two quoted UUID literals out of a generated half-open clause.
+    fn extract_uuids(sql: &str) -> (Uuid, Uuid) {
+        let lits: Vec<&str> = sql.split('\'').filter(|s| s.contains('-')).collect();
+        (uuid(lits[0]), uuid(lits[1]))
+    }
+
+    // ----- time partitioning -----------------------------------------------
+
+    #[test]
+    fn date_range_tiles_year_into_quarters() {
+        let min = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let max = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let parts = by_date_range("SELECT * FROM t", "day", min, max, 4);
+        assert_eq!(parts.len(), 4);
+        assert!(parts[0]
+            .sql
+            .ends_with("WHERE day >= '2024-01-01' AND day < '2024-04-01'"));
+        // 365-day span; ¾ from Jan 1 lands on Sep 30, closed inclusively on max.
+        assert!(parts[3]
+            .sql
+            .ends_with("WHERE day >= '2024-09-30' AND day <= '2024-12-31'"));
+    }
+
+    #[test]
+    fn datetime_range_half_open_with_inclusive_tail() {
+        let min = NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let max = NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 4)
+            .unwrap();
+        let parts = by_datetime_range("SELECT * FROM t", "ts", min, max, 4);
+        assert_eq!(parts.len(), 4);
+        assert!(parts[0]
+            .sql
+            .contains("ts >= '2024-01-01 00:00:00.000000' AND ts < '2024-01-01 00:00:01.000000'"));
+        assert!(parts[3]
+            .sql
+            .contains("AND ts <= '2024-01-01 00:00:04.000000'"));
+    }
+
+    #[test]
+    fn timestamp_range_carries_utc_offset() {
+        use chrono::{TimeZone, Utc};
+        let min = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let max = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 2).unwrap();
+        let parts = by_timestamp_range("SELECT * FROM t", "ts", min, max, 2);
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0]
+            .sql
+            .contains("ts >= '2024-01-01 00:00:00.000000+00:00'"));
+        assert!(parts[1]
+            .sql
+            .contains("AND ts <= '2024-01-01 00:00:02.000000+00:00'"));
+    }
+
+    #[test]
+    fn time_range_edge_cases() {
+        let d0 = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let d1 = NaiveDate::from_ymd_opt(2024, 6, 1).unwrap();
+        assert!(by_date_range("SELECT 1", "d", d1, d0, 4).is_empty()); // min > max
+        assert!(by_date_range("SELECT 1", "d", d0, d1, 0).is_empty()); // zero partitions
+        let same = by_date_range("SELECT 1", "d", d0, d0, 4);
+        assert_eq!(same.len(), 1);
+        assert!(same[0]
+            .sql
+            .contains("d >= '2024-01-01' AND d <= '2024-01-01'"));
     }
 }

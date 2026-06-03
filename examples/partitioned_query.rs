@@ -44,6 +44,17 @@ async fn main() -> Result<(), rust_db_driver::DbError> {
     let rows = driver.query_partitioned(&partitions).await?;
     println!("Got {} rows total across all partitions.", rows.len());
 
+    // Same fan-out, but stream rows as each partition resolves instead of
+    // waiting for every partition to finish and buffering the whole result.
+    use futures::StreamExt;
+    let mut stream = driver.query_partitioned_stream(&partitions);
+    let mut streamed = 0usize;
+    while let Some(row) = stream.next().await {
+        let _row = row?; // process each row as it arrives
+        streamed += 1;
+    }
+    println!("Streamed {streamed} rows incrementally.");
+
     Ok(())
 }
 

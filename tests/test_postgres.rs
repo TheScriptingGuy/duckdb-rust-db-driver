@@ -179,4 +179,89 @@ mod tests {
         );
         assert_eq!(partitioned.len(), 500);
     }
+
+    /// UUID partitioning via the ordering-aware helper (Lexical mode) must match
+    /// the plain helper / single query on PostgreSQL — proving the new
+    /// `by_uuid_range_ordered` path is wire-correct against a real backend.
+    #[ignore = "requires running PostgreSQL"]
+    #[tokio::test]
+    async fn test_query_partitioned_uuid_ordered_lexical_matches_single() {
+        use rust_db_driver::partition::UuidOrder;
+        use uuid::Uuid;
+
+        let driver = PostgresDriver::connect(&test_config()).await.unwrap();
+        let base = "SELECT id FROM uitems";
+        let single = driver.query(base, &[]).await.unwrap();
+
+        let parts = partition::by_uuid_range_ordered(
+            base,
+            "id",
+            Uuid::from_u128(0),
+            Uuid::from_u128(u128::MAX),
+            6,
+            UuidOrder::Lexical,
+        );
+        let partitioned = driver.query_partitioned(&parts).await.unwrap();
+        assert_eq!(partitioned.len(), single.len());
+        assert_eq!(partitioned.len(), 500);
+    }
+
+    /// Timestamp-range partitioning over the `orders.created` column must cover
+    /// every row exactly once — exercising `by_datetime_range`'s half-open
+    /// tiling (with inclusive tail) against real timestamp data.
+    #[ignore = "requires running PostgreSQL"]
+    #[tokio::test]
+    async fn test_query_partitioned_datetime_range_covers_whole_table() {
+        use chrono::{Duration, NaiveDate};
+
+        let driver = PostgresDriver::connect(&test_config()).await.unwrap();
+        let base = "SELECT id, created FROM orders";
+        let single = driver.query(base, &[]).await.unwrap();
+
+        // Seed sets created = '2024-01-01' + g days for g in 1..=1000, so the
+        // values span [2024-01-02, 2024-01-01 + 1000 days] inclusive.
+        let epoch = NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let min = epoch + Duration::days(1);
+        let max = epoch + Duration::days(1000);
+
+        let parts = partition::by_datetime_range(base, "created", min, max, 6);
+        let partitioned = driver.query_partitioned(&parts).await.unwrap();
+
+        assert_eq!(
+            partitioned.len(),
+            single.len(),
+            "datetime-partitioned scan must cover every row exactly once"
+        );
+        assert_eq!(partitioned.len(), 1000);
+    }
+
+    /// Streaming the partitions must yield exactly the same multiset of rows as
+    /// the buffered `query_partitioned`, just delivered incrementally.
+    #[ignore = "requires running PostgreSQL"]
+    #[tokio::test]
+    async fn test_query_partitioned_stream_matches_buffered() {
+        use futures::StreamExt;
+
+        let driver = PostgresDriver::connect(&test_config()).await.unwrap();
+        let parts = partition::by_int_range("SELECT id FROM orders", "id", 1, 1000, 8);
+
+        let buffered = driver.query_partitioned(&parts).await.unwrap();
+
+        let mut stream = driver.query_partitioned_stream(&parts);
+        let mut streamed = Vec::new();
+        while let Some(row) = stream.next().await {
+            streamed.push(row.unwrap());
+        }
+
+        let ids = |rows: &[rust_db_driver::Row]| -> Vec<i64> {
+            let mut v: Vec<i64> = rows.iter().map(|r| as_i64(r.get(0).unwrap())).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(streamed.len(), 1000);
+        assert_eq!(ids(&streamed), ids(&buffered));
+    }
 }
